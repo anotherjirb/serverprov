@@ -3,9 +3,14 @@ frontend:
   phases:
     preBuild:
       commands:
-        - echo "Pre-build Techno OMS Frontend"
-        - echo "Commit: $AWS_COMMIT_ID"
-        - test -f frontend/index.html && echo "index.html found" || (echo "index.html NOT FOUND" && exit 1)
+        - echo "Current directory: $(pwd)"
+        - echo "Listing all files:"
+        - ls -la
+        - echo "Listing frontend directory:"
+        - ls -la frontend/ || echo "frontend directory not found!"
+        - echo "Looking for index.html:"
+        - find . -name "index.html" -type f || echo "index.html not found anywhere!"
+        - test -f frontend/index.html && echo "✓ index.html found at frontend/index.html" || (echo "✗ index.html NOT FOUND at frontend/index.html" && exit 1)
     build:
       commands:
         - echo "No build step required - static HTML"
