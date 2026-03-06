@@ -1,0 +1,24 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - echo "Pre-build: Techno OMS Frontend"
+        - echo "Commit SHA: $AWS_COMMIT_ID"
+    build:
+      commands:
+        - echo "Injecting environment variables into frontend..."
+        - |
+          sed -i "s|https://YOUR_API_ID.execute-api.us-east-1.amazonaws.com/production|${API_ENDPOINT}|g" frontend/index.html
+          sed -i "s|YOUR_API_KEY|${API_KEY}|g" frontend/index.html
+          sed -i "s|us-east-1|${AWS_REGION}|g" frontend/index.html
+        - echo "Build complete!"
+    postBuild:
+      commands:
+        - echo "Frontend deployment done: $(date)"
+  artifacts:
+    baseDirectory: frontend
+    files:
+      - "**/*"
+  cache:
+    paths: []

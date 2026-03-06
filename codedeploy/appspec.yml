@@ -1,0 +1,13 @@
+version: 0.0
+Resources:
+  - techno-lambda-order-management:
+      Type: AWS::Lambda::Function
+      Properties:
+        Name: techno-lambda-order-management
+        Alias: live
+        CurrentVersion: !GetAtt techno-lambda-order-management.Version
+        TargetVersion: !GetAtt techno-lambda-order-management.Version
+
+Hooks:
+  - BeforeAllowTraffic: techno-lambda-health-check
+  - AfterAllowTraffic: techno-lambda-health-check
