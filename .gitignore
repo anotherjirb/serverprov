@@ -4,3 +4,10 @@ awscliv2.zip
 deploy-juri.sh.patch
 
 token
+deploy-juri.sh
+fix-alias.sh
+fix-alias.cors
+fix-layer.sh
+README-JURI.md
+
+.github/workflows.deploy.yml_
