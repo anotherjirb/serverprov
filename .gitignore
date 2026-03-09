@@ -8,6 +8,8 @@ deploy-juri.sh
 fix-alias.sh
 fix-alias.cors
 fix-layer.sh
+fix-cors.sh
 README-JURI.md
 
-.github/workflows.deploy.yml_
+.github\workflows.deploy.yml_
+step_function/
