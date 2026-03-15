@@ -293,11 +293,19 @@ chk("DynamoDB","TTL enabled on techno-orders",2, lambda: (
 ))
 
 # ── Lambda ────────────────────────────────────────────────
-FUNCS = ["order_management","process_payment","update_inventory",
-         "send_notification","generate_report","init_db","health_check"]
-for fn in FUNCS:
-    chk("Lambda",f"Function {P}-{fn} Active",3, lambda fn=fn: (
-        lmb.get_function(FunctionName=f"{P}-{fn}")
+# Nama sesuai deploy.yml: techno-lambda-{dash-name}
+FUNC_NAMES = [
+    "techno-lambda-order-management",
+    "techno-lambda-process-payment",
+    "techno-lambda-update-inventory",
+    "techno-lambda-send-notification",
+    "techno-lambda-generate-report",
+    "techno-lambda-init-db",
+    "techno-lambda-health-check",
+]
+for fn in FUNC_NAMES:
+    chk("Lambda",f"Function {fn} Active",3, lambda fn=fn: (
+        lmb.get_function(FunctionName=fn)
         ["Configuration"]["State"] in ("Active","Idle") and "Active"
     ))
 
@@ -415,10 +423,10 @@ if [[ "$MODE" == "teardown" ]]; then
         ok "API GW deleted" || warn "API GW tidak ditemukan"
 
     warn "Menghapus Lambda functions..."
-    for func in order_management process_payment update_inventory \
-                send_notification generate_report init_db health_check; do
+    for func in order-management process-payment update-inventory \
+                send-notification generate-report init-db health-check; do
         aws lambda delete-function \
-            --function-name "${PROJECT}-${func}" \
+            --function-name "techno-lambda-${func}" \
             --region "$REGION" 2>/dev/null || true
     done
     ok "Lambda deleted"
@@ -980,7 +988,16 @@ open('/tmp/techno_placeholder.zip','wb').write(buf.getvalue())
 
     for FUNC_BASE in order_management process_payment update_inventory \
                      send_notification generate_report init_db health_check; do
-        FUNC_NAME="${PROJECT}-${FUNC_BASE}"
+        # Map dir name → AWS function name (sesuai deploy.yml naming)
+        case "$FUNC_BASE" in
+            order_management)  FUNC_NAME="techno-lambda-order-management"  ;;
+            process_payment)   FUNC_NAME="techno-lambda-process-payment"   ;;
+            update_inventory)  FUNC_NAME="techno-lambda-update-inventory"  ;;
+            send_notification) FUNC_NAME="techno-lambda-send-notification" ;;
+            generate_report)   FUNC_NAME="techno-lambda-generate-report"   ;;
+            init_db)           FUNC_NAME="techno-lambda-init-db"           ;;
+            health_check)      FUNC_NAME="techno-lambda-health-check"      ;;
+        esac
         CFG=$(get_func_config "$FUNC_BASE")
         IFS=':' read -r MEM TMO USE_VPC <<< "$CFG"
 
@@ -1044,10 +1061,10 @@ LAYER_ARN=$(aws lambda list-layer-versions \
 section "STEP 6/11 — Step Functions Order Workflow"
 if ! skip_step 6; then
     # Build ASL definition
-    ORDER_MGT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PROJECT}-order_management"
-    PAYMENT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PROJECT}-process_payment"
-    INVENTORY_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PROJECT}-update_inventory"
-    NOTIF_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PROJECT}-send_notification"
+    ORDER_MGT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:techno-lambda-order-management"
+    PAYMENT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:techno-lambda-process-payment"
+    INVENTORY_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:techno-lambda-update-inventory"
+    NOTIF_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:techno-lambda-send-notification"
 
     SF_DEFINITION=$(cat << SFEOF
 {
@@ -1147,7 +1164,16 @@ SFEOF
 
     # Update Lambda env with SF_ARN
     for FUNC_BASE in order_management process_payment health_check; do
-        FUNC_NAME="${PROJECT}-${FUNC_BASE}"
+        # Map dir name → AWS function name (sesuai deploy.yml naming)
+        case "$FUNC_BASE" in
+            order_management)  FUNC_NAME="techno-lambda-order-management"  ;;
+            process_payment)   FUNC_NAME="techno-lambda-process-payment"   ;;
+            update_inventory)  FUNC_NAME="techno-lambda-update-inventory"  ;;
+            send_notification) FUNC_NAME="techno-lambda-send-notification" ;;
+            generate_report)   FUNC_NAME="techno-lambda-generate-report"   ;;
+            init_db)           FUNC_NAME="techno-lambda-init-db"           ;;
+            health_check)      FUNC_NAME="techno-lambda-health-check"      ;;
+        esac
         aws lambda update-function-configuration \
             --function-name "$FUNC_NAME" \
             --environment "Variables={ORDERS_TABLE=${PROJECT}-orders,INVENTORY_TABLE=${PROJECT}-inventory,PAYMENTS_TABLE=${PROJECT}-payments,SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REPORTS_BUCKET=${S3_REPORTS},DEPLOY_BUCKET=${S3_DEPLOY},STEP_FUNCTIONS_ARN=${SF_ARN},REGION=${REGION}}" \
@@ -1203,10 +1229,26 @@ if ! skip_step 7; then
         echo "$RID"
     }
 
+    # Helper: resolve dir_name → AWS Lambda name (sesuai deploy.yml)
+    resolve_func_name() {
+        case "$1" in
+            order_management)  echo "techno-lambda-order-management"  ;;
+            process_payment)   echo "techno-lambda-process-payment"   ;;
+            update_inventory)  echo "techno-lambda-update-inventory"  ;;
+            send_notification) echo "techno-lambda-send-notification" ;;
+            generate_report)   echo "techno-lambda-generate-report"   ;;
+            init_db)           echo "techno-lambda-init-db"           ;;
+            health_check)      echo "techno-lambda-health-check"      ;;
+            *) echo "$1" ;;
+        esac
+    }
+
     # Helper: setup method + integration
     setup_method() {
-        local RID="$1" METHOD="$2" FUNC="$3" KEY_REQ="$4"
-        local LAMBDA_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PROJECT}-${FUNC}"
+        local RID="$1" METHOD="$2" FUNC_DIR="$3" KEY_REQ="$4"
+        local FUNC_NAME
+        FUNC_NAME=$(resolve_func_name "$FUNC_DIR")
+        local LAMBDA_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNC_NAME}"
         local URI="arn:aws:apigateway:${REGION}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations"
 
         aws apigateway delete-method \
@@ -1229,14 +1271,14 @@ if ! skip_step 7; then
             --region "$REGION" --no-cli-pager > /dev/null
 
         aws lambda add-permission \
-            --function-name "${PROJECT}-${FUNC}" \
+            --function-name "$FUNC_NAME" \
             --statement-id "apigw-${METHOD}-${RID}-$(date +%s)" \
             --action lambda:InvokeFunction \
             --principal apigateway.amazonaws.com \
             --source-arn "arn:aws:execute-api:${REGION}:${ACCOUNT_ID}:${API_ID}/*/*" \
             --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
 
-        log "  ${METHOD} -> ${PROJECT}-${FUNC} (key=${KEY_REQ})"
+        log "  ${METHOD} -> ${FUNC_NAME} (key=${KEY_REQ})"
     }
 
     # Helper: setup CORS OPTIONS (MOCK integration) pada sebuah resource
@@ -1375,7 +1417,7 @@ resolve_state
 # ================================================================
 section "STEP 8/11 — EventBridge (Daily Report Rule)"
 if ! skip_step 8; then
-    REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PROJECT}-generate_report"
+    REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:techno-lambda-generate-report"
 
     aws events put-rule \
         --name "${PROJECT}-daily-report" \
@@ -1385,7 +1427,7 @@ if ! skip_step 8; then
         --region "$REGION" --no-cli-pager > /dev/null
 
     aws lambda add-permission \
-        --function-name "${PROJECT}-generate_report" \
+        --function-name "techno-lambda-generate-report" \
         --statement-id "eventbridge-daily-$(date +%s)" \
         --action lambda:InvokeFunction \
         --principal events.amazonaws.com \
@@ -1410,7 +1452,16 @@ if ! skip_step 9; then
     for FUNC_BASE in order_management process_payment update_inventory \
                      send_notification generate_report init_db health_check; do
         LAMBDA_FILE="${SCRIPT_DIR}/lambda/${FUNC_BASE}/lambda_function.py"
-        FUNC_NAME="${PROJECT}-${FUNC_BASE}"
+        # Map dir name → AWS function name (sesuai deploy.yml naming)
+        case "$FUNC_BASE" in
+            order_management)  FUNC_NAME="techno-lambda-order-management"  ;;
+            process_payment)   FUNC_NAME="techno-lambda-process-payment"   ;;
+            update_inventory)  FUNC_NAME="techno-lambda-update-inventory"  ;;
+            send_notification) FUNC_NAME="techno-lambda-send-notification" ;;
+            generate_report)   FUNC_NAME="techno-lambda-generate-report"   ;;
+            init_db)           FUNC_NAME="techno-lambda-init-db"           ;;
+            health_check)      FUNC_NAME="techno-lambda-health-check"      ;;
+        esac
 
         if [ ! -f "$LAMBDA_FILE" ]; then
             warn "Lambda source tidak ditemukan: $LAMBDA_FILE — skip"
@@ -1691,7 +1742,7 @@ section "STEP 10/11 — Initialize Database (invoke init_db)"
 if ! skip_step 10; then
     log "Invoking init_db Lambda..."
     INIT_RESULT=$(aws lambda invoke \
-        --function-name "${PROJECT}-init_db" \
+        --function-name "techno-lambda-init-db" \
         --payload '{"action":"init"}' \
         --region "$REGION" \
         --cli-binary-format raw-in-base64-out \
