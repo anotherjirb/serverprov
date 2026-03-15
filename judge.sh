@@ -1953,6 +1953,38 @@ fi
 # ================================================================
 section "STEP 9/11 — CI/CD (Lambda Code Deploy + Amplify Frontend)"
 if ! skip_step 9; then
+    # Tulis helper fix_xray.py sekali di awal
+    python3 - << 'WRITE_XRAY_FIX'
+content = r"""import sys
+with open(sys.argv[1]) as f:
+    src = f.read()
+old1 = "from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+
+patch_all()"
+new1 = "try:
+    from aws_xray_sdk.core import xray_recorder
+    from aws_xray_sdk.core import patch_all
+    patch_all()
+except Exception:
+    pass"
+old2 = "from aws_xray_sdk.core import patch_all
+
+patch_all()"
+new2 = "try:
+    from aws_xray_sdk.core import patch_all
+    patch_all()
+except Exception:
+    pass"
+src = src.replace(old1, new1).replace(old2, new2)
+with open(sys.argv[2], 'w') as f:
+    f.write(src)
+"""
+with open('/tmp/fix_xray_import.py', 'w') as f:
+    f.write(content)
+print("fix_xray_import.py written")
+WRITE_XRAY_FIX
+
     # ── Deploy real Lambda code ───────────────────────────
     TMP_PKG=$(mktemp -d)
 
@@ -2019,6 +2051,24 @@ ROUTE_HANDLER = (
     "        return response(404, {'error': 'Route not found'})"
 )
 
+# Fix xray import — wrap agar tidak crash jika xray tidak tersedia di layer
+XRAY_SAFE = (
+    "try:\n"
+    "    from aws_xray_sdk.core import xray_recorder\n"
+    "    from aws_xray_sdk.core import patch_all\n"
+    "    patch_all()\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+src = src.replace(
+    "from aws_xray_sdk.core import xray_recorder\nfrom aws_xray_sdk.core import patch_all\n\npatch_all()",
+    XRAY_SAFE.rstrip()
+)
+src = src.replace(
+    "from aws_xray_sdk.core import patch_all\n\npatch_all()",
+    "try:\n    from aws_xray_sdk.core import patch_all\n    patch_all()\nexcept Exception:\n    pass"
+)
+
 if '/workflows/stats' not in src:
     src = src.replace(
         "\ndef lambda_handler(event, context):",
@@ -2028,9 +2078,9 @@ if '/workflows/stats' not in src:
         "        return response(404, {'error': 'Route not found'})",
         ROUTE_HANDLER
     )
-    print("  Patched: /workflows/stats added to order_management")
+    print("  Patched: /workflows/stats added + xray safe import")
 else:
-    print("  /workflows/stats already present")
+    print("  Already patched")
 
 with open(dst_file, 'w') as f:
     f.write(src)
@@ -2040,7 +2090,7 @@ PYEOF_PATCH
                 "$LAMBDA_FILE" \
                 "${TMP_PKG}/lambda_function.py"
         else
-            cp "$LAMBDA_FILE" "${TMP_PKG}/lambda_function.py"
+            python3 /tmp/fix_xray_import.py                 "$LAMBDA_FILE" "${TMP_PKG}/lambda_function.py" 2>/dev/null ||             cp "$LAMBDA_FILE" "${TMP_PKG}/lambda_function.py"
         fi
         (cd "$TMP_PKG" && zip -q "${FUNC_BASE}.zip" "lambda_function.py")
 
