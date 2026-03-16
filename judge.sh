@@ -895,12 +895,106 @@ if ! skip_step 3; then
             --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
     fi
 
-    # RDS Subnet Group
+    # ── RDS Subnet Group — auto-fix AZ mismatch ──────────────────────────
+    # Masalah: subnet private dari CFN bisa jatuh di AZ yang tidak support
+    # db.t3.micro + gp2 (terutama di AWS Academy / LabRole environment).
+    # Solusi: query AZ yang didukung RDS, lalu buat subnet tambahan di sana
+    # jika AZ yang ada tidak overlap dengan AZ yang didukung.
+    log "Checking RDS-supported AZs for db.t3.micro + gp2..."
+
+    # AZ dari subnet yang ada
+    AZ_SN1=$(aws ec2 describe-subnets --subnet-ids "$PRIV_SN1" \
+        --query "Subnets[0].AvailabilityZone" --output text --region "$REGION" 2>/dev/null || echo "")
+    AZ_SN2=$(aws ec2 describe-subnets --subnet-ids "$PRIV_SN2" \
+        --query "Subnets[0].AvailabilityZone" --output text --region "$REGION" 2>/dev/null || echo "")
+    log "  Existing subnet AZs: $AZ_SN1, $AZ_SN2"
+
+    # AZ yang didukung RDS untuk db.t3.micro + gp2
+    RDS_SUPPORTED_AZS=$(aws rds describe-orderable-db-instance-options \
+        --engine postgres \
+        --db-instance-class db.t3.micro \
+        --query "OrderableDBInstanceOptions[?StorageType=='gp2' && MultiAZCapable==\`false\`].AvailabilityZones[].Name" \
+        --output text --region "$REGION" 2>/dev/null | tr '\t' '\n' | sort -u || echo "")
+    log "  RDS supported AZs : $(echo $RDS_SUPPORTED_AZS | tr '\n' ' ')"
+
+    # Kumpulkan subnet IDs yang AZ-nya didukung RDS
+    RDS_SUBNET_IDS="$PRIV_SN1 $PRIV_SN2"
+
+    for _AZ in $RDS_SUPPORTED_AZS; do
+        # Cek apakah AZ ini sudah punya subnet private di VPC kita
+        _EXISTING_SN=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=availabilityZone,Values=${_AZ}" \
+                      "Name=tag:Name,Values=${PROJECT}-subnet*" \
+            --query "Subnets[0].SubnetId" --output text --region "$REGION" 2>/dev/null || echo "")
+
+        if [ -n "$_EXISTING_SN" ] && [ "$_EXISTING_SN" != "None" ]; then
+            # Sudah ada subnet di AZ ini — tambahkan ke daftar
+            if ! echo "$RDS_SUBNET_IDS" | grep -q "$_EXISTING_SN"; then
+                RDS_SUBNET_IDS="$RDS_SUBNET_IDS $_EXISTING_SN"
+                log "  Reusing existing subnet $_EXISTING_SN in $_AZ"
+            fi
+        elif [ "$_AZ" != "$AZ_SN1" ] && [ "$_AZ" != "$AZ_SN2" ]; then
+            # AZ ini didukung RDS tapi belum ada subnet — buat subnet baru
+            # Pilih CIDR kosong di 10.30.x.0/24
+            _USED_CIDRS=$(aws ec2 describe-subnets \
+                --filters "Name=vpc-id,Values=${VPC_ID}" \
+                --query "Subnets[].CidrBlock" --output text --region "$REGION" 2>/dev/null \
+                | tr '\t' '\n' | grep "^10\.30\." | sort)
+            # Cari slot /24 yang belum terpakai (mulai dari 10.30.10.0/24)
+            for _OCT in 10 11 12 13 14 15; do
+                _CANDIDATE="10.30.${_OCT}.0/24"
+                if ! echo "$_USED_CIDRS" | grep -q "$_CANDIDATE"; then
+                    log "  Creating extra private subnet in $_AZ with CIDR $_CANDIDATE..."
+                    _NEW_SN=$(aws ec2 create-subnet \
+                        --vpc-id "$VPC_ID" \
+                        --cidr-block "$_CANDIDATE" \
+                        --availability-zone "$_AZ" \
+                        --region "$REGION" \
+                        --query "Subnet.SubnetId" --output text 2>/dev/null || echo "")
+                    if [ -n "$_NEW_SN" ] && [ "$_NEW_SN" != "None" ]; then
+                        # Tag subnet
+                        aws ec2 create-tags \
+                            --resources "$_NEW_SN" \
+                            --tags "Key=Name,Value=${PROJECT}-subnet-private-rds-${_AZ}" \
+                            --region "$REGION" > /dev/null 2>&1 || true
+                        # Asosiasikan ke route table private agar Lambda bisa reach
+                        _PRIV_RTB=$(aws ec2 describe-route-tables \
+                            --filters "Name=vpc-id,Values=${VPC_ID}" \
+                                      "Name=tag:Name,Values=${PROJECT}-rtb-private" \
+                            --query "RouteTables[0].RouteTableId" \
+                            --output text --region "$REGION" 2>/dev/null || echo "")
+                        [ -n "$_PRIV_RTB" ] && [ "$_PRIV_RTB" != "None" ] && \
+                            aws ec2 associate-route-table \
+                                --subnet-id "$_NEW_SN" \
+                                --route-table-id "$_PRIV_RTB" \
+                                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+                        RDS_SUBNET_IDS="$RDS_SUBNET_IDS $_NEW_SN"
+                        ok "  New subnet $_NEW_SN created in $_AZ ($_CANDIDATE)"
+                    fi
+                    break
+                fi
+            done
+        fi
+
+        # Sudah punya ≥2 AZ yang didukung, cukup
+        _AZ_COUNT=$(echo "$RDS_SUBNET_IDS" | wc -w)
+        [ "$_AZ_COUNT" -ge 2 ] && [ -n "$(echo $RDS_SUPPORTED_AZS | grep -o "$AZ_SN1\|$AZ_SN2" | head -1)" ] && break
+    done
+
+    log "  Final subnet IDs for RDS subnet group: $RDS_SUBNET_IDS"
+
+    # Hapus subnet group lama jika ada (supaya bisa update dengan subnet baru)
+    aws rds delete-db-subnet-group \
+        --db-subnet-group-name "${PROJECT}-rds-subnet-group" \
+        --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+
     aws rds create-db-subnet-group \
         --db-subnet-group-name "${PROJECT}-rds-subnet-group" \
         --db-subnet-group-description "Techno OMS RDS" \
-        --subnet-ids "$PRIV_SN1" "$PRIV_SN2" \
-        --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+        --subnet-ids $RDS_SUBNET_IDS \
+        --region "$REGION" --no-cli-pager > /dev/null
+    ok "RDS subnet group created with AZs: $AZ_SN1 $AZ_SN2"
 
     # Migrate: jika ada techno-rds (nama lama), rename ke techno-rds-orders
     OLD_RDS=$(aws rds describe-db-instances         --db-instance-identifier "${PROJECT}-rds"         --query "DBInstances[0].DBInstanceStatus"         --output text --region "$REGION" 2>/dev/null || echo "NOT_FOUND")
@@ -1127,53 +1221,84 @@ if ! skip_step 5; then
         rm -rf "$LAYER_DIR" && mkdir -p "${LAYER_DIR}/python"
 
         # ── Strategi build layer (urutan prioritas) ───────────────
-        # 1. Docker (paling benar — compile di environment Lambda yang sama)
-        # 2. pip source install di Linux native (CloudShell/EC2)
-        # 3. pip --no-binary fallback
+        # 1. Docker (paling benar — build di image Lambda Python:3.11 yang identik)
+        # 2. pip native install di Linux (CloudShell/EC2 — tanpa --no-binary)
+        # 3. pip manylinux pre-built wheel (fallback, hanya jika psycopg2 berhasil)
         #
-        # psycopg2-binary TIDAK bisa pakai --platform manylinux karena
-        # wheel-nya tidak include libpq.so. Harus compile dari source
-        # di Linux environment yang sama dengan Lambda (Amazon Linux 2023).
+        # CATATAN PENTING: psycopg2-binary sudah bundle libpq.so di dalam wheel-nya.
+        # --no-binary psycopg2-binary SALAH karena itu memaksa compile dari C source
+        # dan butuh libpq-dev di build environment — jarang tersedia di Lambda/CloudShell.
+        # Solusi: biarkan pip pakai binary wheel (default), tanpa flag --no-binary.
 
         LAYER_BUILD_OK=false
 
         # ── Metode 1: Docker ─────────────────────────────────────
+        # PENTING: Jangan pakai --no-binary psycopg2-binary karena itu
+        # memaksa compile dari source, padahal Lambda container tidak punya
+        # libpq-dev. psycopg2-binary sudah bundle libpq sendiri — pakai wheel-nya.
         if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
             log "  Metode 1: Docker build (Amazon Linux 2023 = Lambda runtime)..."
-            docker run --rm                 -v "${LAYER_DIR}/python:/var/task/python"                 -v "${REQUIREMENTS_FILE}:/var/task/requirements.txt:ro"                 public.ecr.aws/lambda/python:3.11                 /bin/bash -c "
-                    pip install -r /var/task/requirements.txt                         --target /var/task/python                         --no-binary psycopg2-binary                         --upgrade -q
-                " && LAYER_BUILD_OK=true && ok "  Docker build sukses" ||                 warn "  Docker build gagal, coba metode lain..."
+            docker run --rm \
+                -v "${LAYER_DIR}/python:/var/task/python" \
+                -v "${REQUIREMENTS_FILE}:/var/task/requirements.txt:ro" \
+                public.ecr.aws/lambda/python:3.11 \
+                pip install -r /var/task/requirements.txt \
+                    --target /var/task/python \
+                    --upgrade -q \
+            && LAYER_BUILD_OK=true && ok "  Docker build sukses" \
+            || warn "  Docker build gagal, coba metode lain..."
         else
             warn "  Docker tidak tersedia, skip metode 1"
         fi
 
-        # ── Metode 2: pip source build di Linux native ────────────
+        # ── Metode 2: pip native build di Linux ──────────────────
+        # PENTING: Hapus --no-binary agar psycopg2-binary pakai pre-built wheel.
+        # Compile dari source hanya diperlukan jika kamu sengaja pakai psycopg2
+        # (bukan psycopg2-binary) dan sudah install postgresql-devel di host.
         if [ "$LAYER_BUILD_OK" = "false" ]; then
-            log "  Metode 2: pip source build di Linux native..."
-            # Pastikan postgresql-devel tersedia untuk compile psycopg2
+            log "  Metode 2: pip native build di Linux..."
             if command -v yum &>/dev/null; then
                 sudo yum install -y postgresql-devel gcc python3-devel 2>/dev/null || true
             elif command -v apt-get &>/dev/null; then
                 sudo apt-get install -y libpq-dev gcc python3-dev 2>/dev/null || true
             fi
-            pip3 install -r "$REQUIREMENTS_FILE"                 --target "${LAYER_DIR}/python"                 --no-binary psycopg2-binary                 --upgrade -q 2>/dev/null &&             LAYER_BUILD_OK=true && ok "  pip source build sukses" ||             warn "  pip source build gagal, coba metode 3..."
+            pip3 install -r "$REQUIREMENTS_FILE" \
+                --target "${LAYER_DIR}/python" \
+                --upgrade -q 2>/dev/null \
+            && LAYER_BUILD_OK=true && ok "  pip native build sukses" \
+            || warn "  pip native build gagal, coba metode 3..."
         fi
 
-        # ── Metode 3: pip tanpa psycopg2, pakai versi pre-compiled ─
+        # ── Metode 3: manylinux pre-built wheel (fallback terakhir) ─
+        # FIX: LAYER_BUILD_OK=true hanya diset jika psycopg2 benar-benar berhasil.
+        # Sebelumnya, flag ini di-set tanpa cek hasil instalasi psycopg2,
+        # sehingga layer bisa diupload dalam kondisi kosong/rusak.
         if [ "$LAYER_BUILD_OK" = "false" ]; then
-            log "  Metode 3: install semua paket + psycopg2-binary Lambda wheel..."
+            log "  Metode 3: install paket + psycopg2 manylinux pre-built wheel..."
             rm -rf "${LAYER_DIR}/python" && mkdir -p "${LAYER_DIR}/python"
 
             # Install semua paket kecuali psycopg2 dulu
             grep -v "psycopg2" "$REQUIREMENTS_FILE" > /tmp/req_no_psyco.txt || true
-            pip3 install -r /tmp/req_no_psyco.txt                 --target "${LAYER_DIR}/python" -q 2>/dev/null || true
+            pip3 install -r /tmp/req_no_psyco.txt \
+                --target "${LAYER_DIR}/python" -q 2>/dev/null || true
 
-            # Download psycopg2-binary wheel khusus Lambda (awslambda-psycopg2)
-            # ini adalah psycopg2 yang sudah dikompilasi untuk Amazon Linux
-            pip3 install aws-psycopg2                 --target "${LAYER_DIR}/python" -q 2>/dev/null ||             pip3 install psycopg2-binary                 --target "${LAYER_DIR}/python"                 --platform manylinux2014_x86_64                 --implementation cp --python-version 3.11                 --only-binary=:all: -q 2>/dev/null ||             warn "  Semua metode psycopg2 gagal"
-
-            LAYER_BUILD_OK=true
-            warn "  Metode 3 digunakan — psycopg2 mungkin perlu verifikasi"
+            # Coba aws-psycopg2 (compiled untuk Amazon Linux), fallback ke manylinux wheel
+            if pip3 install aws-psycopg2 \
+                    --target "${LAYER_DIR}/python" -q 2>/dev/null; then
+                LAYER_BUILD_OK=true
+                ok "  aws-psycopg2 installed"
+            elif pip3 install psycopg2-binary \
+                    --target "${LAYER_DIR}/python" \
+                    --platform manylinux2014_x86_64 \
+                    --implementation cp --python-version 311 \
+                    --only-binary=:all: -q 2>/dev/null; then
+                LAYER_BUILD_OK=true
+                ok "  psycopg2-binary manylinux wheel installed"
+            else
+                # Jangan lanjut — layer tanpa psycopg2 pasti ImportError di Lambda
+                err "Semua metode instalasi psycopg2 gagal. Pastikan internet tersedia atau Docker bisa dijalankan."
+            fi
+            warn "  Metode 3 digunakan — verifikasi psycopg2 folder di bawah"
         fi
 
         # ── Verifikasi struktur folder ────────────────────────────
