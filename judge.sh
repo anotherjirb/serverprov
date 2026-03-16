@@ -1220,91 +1220,126 @@ if ! skip_step 5; then
 
         rm -rf "$LAYER_DIR" && mkdir -p "${LAYER_DIR}/python"
 
-        # ── Strategi build layer (urutan prioritas) ───────────────
-        # 1. Docker  — build di image Lambda Python:3.11 yang 100% identik runtime
-        # 2. pip native — di Linux/CloudShell dengan aws-psycopg2
-        # 3. manylinux wheel — fallback, hanya jika psycopg2 benar-benar berhasil
+        # ══════════════════════════════════════════════════════════
+        #  LAYER BUILD — ROOT CAUSE & STRATEGI
+        # ══════════════════════════════════════════════════════════
+        # ERROR "No module named psycopg2._psycopg" terjadi karena:
         #
-        # ROOT CAUSE "No module named psycopg2._psycopg":
-        #   psycopg2-binary dari PyPI dibuild di Ubuntu/CentOS dengan libssl/libpq
-        #   versi tertentu. Lambda AL2023 punya glibc/libssl berbeda sehingga
-        #   bundled .so gagal dlopen() → ImportError.
+        #   psycopg2-binary dari PyPI mem-bundle libpq.so + libssl.so
+        #   yang dikompilasi di Ubuntu dengan OpenSSL 1.x. Lambda Python 3.11
+        #   jalan di Amazon Linux 2023 (glibc 2.34, OpenSSL 3.x) — shared
+        #   library symbol version-nya tidak cocok → dlopen() gagal saat import.
         #
-        # SOLUSI: ganti psycopg2-binary → aws-psycopg2 yang dikompilasi khusus
-        # untuk Amazon Linux. Paket ini adalah fork resmi untuk Lambda/EC2 AL2.
-        # Referensi: https://github.com/jkehler/awslambda-psycopg2
+        # aws-psycopg2 juga tidak cukup: dikompilasi di AL2 (glibc 2.17),
+        # bukan AL2023, sehingga masih bisa crash di Lambda Python 3.11.
+        #
+        # SATU-SATUNYA SOLUSI 100% RELIABLE:
+        #   Compile psycopg2 dari SOURCE **di dalam** Lambda Docker container
+        #   (public.ecr.aws/lambda/python:3.11 = image yang 100% sama dengan
+        #   runtime Lambda). Hasilnya: .so link ke libpq system AL2023 langsung,
+        #   tanpa bundle — tidak ada mismatch.
+        #
+        # Fallback (tanpa Docker): pakai manylinux_2_28 wheel yang sesuai AL2023.
+        # ══════════════════════════════════════════════════════════
 
         LAYER_BUILD_OK=false
 
-        # Buat requirements khusus Lambda: ganti psycopg2-binary → aws-psycopg2
-        LAMBDA_REQ="/tmp/req_lambda.txt"
-        sed 's/psycopg2-binary.*/aws-psycopg2/g; s/^psycopg2[^2=<>!].*/aws-psycopg2/g' \
-            "$REQUIREMENTS_FILE" > "$LAMBDA_REQ"
-        log "  Requirements Lambda (swap psycopg2-binary → aws-psycopg2):"
-        cat "$LAMBDA_REQ"
+        # Requirements tanpa psycopg2 (psycopg2 diinstall terpisah dari source)
+        LAMBDA_REQ_REST="/tmp/req_no_psyco.txt"
+        grep -iv "psycopg2" "$REQUIREMENTS_FILE" > "$LAMBDA_REQ_REST" || true
 
-        # ── Metode 1: Docker ─────────────────────────────────────
+        # ── Metode 1: Docker — compile psycopg2 dari SOURCE di Lambda container ──
+        # Ini adalah metode PALING BENAR. psycopg2 dikompilasi di environment
+        # yang identik dengan Lambda runtime (AL2023, glibc 2.34, OpenSSL 3.x).
         if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-            log "  Metode 1: Docker build (public.ecr.aws/lambda/python:3.11)..."
+            log "  Metode 1: Docker — compile psycopg2 dari source di Lambda AL2023..."
             docker run --rm \
-                -v "${LAYER_DIR}/python:/var/task/python" \
-                -v "${LAMBDA_REQ}:/var/task/requirements.txt:ro" \
+                -v "${LAYER_DIR}/python:/out/python" \
+                -v "${REQUIREMENTS_FILE}:/tmp/requirements.txt:ro" \
+                --entrypoint /bin/bash \
                 public.ecr.aws/lambda/python:3.11 \
-                pip install -r /var/task/requirements.txt \
-                    --target /var/task/python \
-                    --upgrade -q \
-            && LAYER_BUILD_OK=true && ok "  Docker build sukses" \
+                -c "
+                    set -e
+                    # Install libpq development headers (diperlukan untuk compile psycopg2)
+                    dnf install -y postgresql15-devel gcc python3-devel 2>/dev/null \
+                    || dnf install -y postgresql-devel gcc python3-devel 2>/dev/null \
+                    || yum install -y postgresql-devel gcc python3-devel 2>/dev/null \
+                    || true
+
+                    # Compile psycopg2 dari source — link ke libpq system Lambda
+                    pip install psycopg2==2.9.9 \
+                        --no-binary psycopg2 \
+                        --target /out/python -q
+
+                    # Install paket lain (boto3, requests, pandas, dll) — pakai binary wheel biasa
+                    grep -iv psycopg2 /tmp/requirements.txt > /tmp/req_rest.txt
+                    pip install -r /tmp/req_rest.txt \
+                        --target /out/python --upgrade -q
+                " \
+            && LAYER_BUILD_OK=true && ok "  Docker build sukses (psycopg2 dari source)" \
             || warn "  Docker build gagal, coba metode lain..."
         else
             warn "  Docker tidak tersedia, skip metode 1"
         fi
 
-        # ── Metode 2: pip native build di Linux ──────────────────
+        # ── Metode 2: pip native — compile dari source di host Linux ─────────
+        # Fallback jika Docker tidak tersedia. Hanya berfungsi jika host adalah
+        # Linux dengan postgresql-devel terinstall (misalnya EC2 AL2, CloudShell).
         if [ "$LAYER_BUILD_OK" = "false" ]; then
-            log "  Metode 2: pip native build (aws-psycopg2)..."
-            pip3 install -r "$LAMBDA_REQ" \
-                --target "${LAYER_DIR}/python" \
-                --upgrade -q 2>/dev/null \
-            && LAYER_BUILD_OK=true && ok "  pip native build sukses" \
+            log "  Metode 2: pip native — compile psycopg2 dari source di host..."
+            if command -v dnf &>/dev/null; then
+                sudo dnf install -y postgresql15-devel gcc python3-devel 2>/dev/null \
+                || sudo dnf install -y postgresql-devel gcc python3-devel 2>/dev/null || true
+            elif command -v yum &>/dev/null; then
+                sudo yum install -y postgresql-devel gcc python3-devel 2>/dev/null || true
+            elif command -v apt-get &>/dev/null; then
+                sudo apt-get install -y libpq-dev gcc python3-dev 2>/dev/null || true
+            fi
+            pip3 install psycopg2==2.9.9 \
+                --no-binary psycopg2 \
+                --target "${LAYER_DIR}/python" -q 2>/dev/null \
+            && pip3 install -r "$LAMBDA_REQ_REST" \
+                --target "${LAYER_DIR}/python" --upgrade -q 2>/dev/null \
+            && LAYER_BUILD_OK=true && ok "  pip native source build sukses" \
             || warn "  pip native build gagal, coba metode 3..."
         fi
 
-        # ── Metode 3: manylinux wheel (fallback) ─────────────────
-        # LAYER_BUILD_OK=true HANYA diset kalau psycopg2 berhasil terinstall.
+        # ── Metode 3: manylinux_2_28 wheel ───────────────────────────────────
+        # Lambda Python 3.11 = AL2023 = glibc 2.34.
+        # manylinux_2_28 wheel dibuild untuk glibc >= 2.28 (RHEL8/AL2023)
+        # sehingga .so-nya compatible — lebih aman dari manylinux2014.
+        # CATATAN: wheel ini TETAP bundle libpq, masih bisa gagal jika
+        # versi OpenSSL berbenturan. Gunakan hanya jika Docker tidak ada.
         if [ "$LAYER_BUILD_OK" = "false" ]; then
-            log "  Metode 3: install paket + aws-psycopg2 / manylinux wheel..."
+            log "  Metode 3: psycopg2-binary manylinux_2_28 + manylinux2014 fallback..."
             rm -rf "${LAYER_DIR}/python" && mkdir -p "${LAYER_DIR}/python"
+            pip3 install -r "$LAMBDA_REQ_REST" \
+                --target "${LAYER_DIR}/python" --upgrade -q 2>/dev/null || true
 
-            # Install semua paket selain psycopg2 dulu
-            grep -iv "psycopg2" "$LAMBDA_REQ" > /tmp/req_no_psyco.txt || true
-            pip3 install -r /tmp/req_no_psyco.txt \
-                --target "${LAYER_DIR}/python" -q 2>/dev/null || true
-
-            # 3a. aws-psycopg2 — paling compatible dengan Lambda AL2/AL2023
-            if pip3 install aws-psycopg2 \
-                    --target "${LAYER_DIR}/python" -q 2>/dev/null; then
-                LAYER_BUILD_OK=true
-                ok "  aws-psycopg2 installed (Amazon Linux build)"
-            # 3b. psycopg2-binary manylinux_2_17 — glibc >= 2.17, cocok AL2023
-            elif pip3 install psycopg2-binary \
+            # 3a. manylinux_2_28 (AL2023-compatible, glibc >= 2.28)
+            if pip3 install psycopg2-binary \
                     --target "${LAYER_DIR}/python" \
-                    --platform manylinux_2_17_x86_64 \
+                    --platform manylinux_2_28_x86_64 \
                     --implementation cp --python-version 311 \
                     --only-binary=:all: -q 2>/dev/null; then
                 LAYER_BUILD_OK=true
-                ok "  psycopg2-binary manylinux_2_17 wheel installed"
-            # 3c. manylinux2014 (alias manylinux_2_17, nama lama)
+                ok "  psycopg2-binary manylinux_2_28 installed"
+            # 3b. aws-psycopg2 (compiled untuk AL2, masih cukup compatible)
+            elif pip3 install aws-psycopg2 \
+                    --target "${LAYER_DIR}/python" -q 2>/dev/null; then
+                LAYER_BUILD_OK=true
+                ok "  aws-psycopg2 installed"
+            # 3c. manylinux2014 sebagai last resort
             elif pip3 install psycopg2-binary \
                     --target "${LAYER_DIR}/python" \
                     --platform manylinux2014_x86_64 \
                     --implementation cp --python-version 311 \
                     --only-binary=:all: -q 2>/dev/null; then
                 LAYER_BUILD_OK=true
-                ok "  psycopg2-binary manylinux2014 wheel installed"
+                warn "  psycopg2-binary manylinux2014 installed — mungkin masih gagal di AL2023"
             else
-                err "Semua metode psycopg2 gagal. Pastikan internet tersedia atau Docker aktif, lalu jalankan ulang step 5."
+                err "Semua metode psycopg2 gagal. Aktifkan Docker lalu jalankan ulang step 5."
             fi
-            warn "  Metode 3 digunakan — verifikasi psycopg2 folder di bawah"
         fi
 
         # ── Verifikasi struktur folder ────────────────────────────
