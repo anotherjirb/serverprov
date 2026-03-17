@@ -45,12 +45,14 @@ jobs:
 
       - name: Notify fork via SNS
         if: steps.check_fork.outputs.is_fork == 'true'
+        continue-on-error: true
         run: |
           aws sns publish \
             --topic-arn "${{ secrets.SNS_TOPIC_ARN }}" \
             --subject "Fork Detected: ${{ github.repository }}" \
             --message "Fork by ${{ github.actor }} on ${{ github.repository }} commit ${{ github.sha }}" \
-            --region ${{ env.AWS_REGION }}
+            --region ${{ env.AWS_REGION }} \
+            || echo "WARN: SNS publish gagal (SCP restriction di AWS Academy)"
 
       - name: Log pipeline start
         run: |
@@ -138,9 +140,6 @@ jobs:
           zip -q /tmp/${FUNC_NAME}.zip lambda_function.py
 
       - name: Upload zip to S3
-        # S3 upload adalah opsional (arsip artifact). Lambda diupdate langsung
-        # via --zip-file di step berikutnya, jadi AccessDenied di sini tidak fatal.
-        continue-on-error: true
         run: |
           aws s3 cp /tmp/${FUNC_NAME}.zip \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/${FUNC_NAME}/${{ github.sha }}.zip" \
@@ -212,9 +211,6 @@ jobs:
           echo "Packaged order-management"
 
       - name: Upload zip to S3
-        # S3 upload adalah opsional (arsip artifact). Lambda diupdate langsung
-        # via --zip-file di step berikutnya, jadi AccessDenied di sini tidak fatal.
-        continue-on-error: true
         run: |
           aws s3 cp /tmp/techno-lambda-order-management.zip \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/techno-lambda-order-management/${{ github.sha }}.zip" \
@@ -253,12 +249,14 @@ jobs:
           echo "CURRENT=$CURRENT" >> $GITHUB_OUTPUT
           echo "Blue=$CURRENT Green=${{ steps.publish.outputs.VERSION }}"
 
-      - name: Upload AppSpec to S3
-        id: appspec
+      - name: Create AppSpec and CodeDeploy deployment (Canary Blue/Green)
+        id: codedeploy
         run: |
-          S3_KEY="codedeploy/order-management/${{ github.sha }}.json"
-          cat > /tmp/appspec.json << APPSPEC
-          {
+          # Buat appspec.json ke file lalu upload S3, ATAU gunakan inline revision.
+          # Tulis dulu via printf agar tidak ada quoting issue di YAML.
+          CUR="${{ steps.blue.outputs.CURRENT }}"
+          TGT="${{ steps.publish.outputs.VERSION }}"
+          printf '{
             "version": 0.0,
             "Resources": [{
               "techno-lambda-order-management": {
@@ -266,21 +264,25 @@ jobs:
                 "Properties": {
                   "Name": "techno-lambda-order-management",
                   "Alias": "live",
-                  "CurrentVersion": "${{ steps.blue.outputs.CURRENT }}",
-                  "TargetVersion": "${{ steps.publish.outputs.VERSION }}"
+                  "CurrentVersion": "%s",
+                  "TargetVersion": "%s"
                 }
               }
             }]
-          }
-          APPSPEC
+          }' "$CUR" "$TGT" > /tmp/appspec.json
+          echo "AppSpec content:"
+          cat /tmp/appspec.json
+
+          # Upload appspec ke S3 (bucket policy sudah allow voclabs PutObject)
+          S3_KEY="codedeploy/order-management/${{ github.sha }}.json"
           aws s3 cp /tmp/appspec.json \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${S3_KEY}" \
-            --region ${{ env.AWS_REGION }}
-          echo "S3_KEY=$S3_KEY" >> $GITHUB_OUTPUT
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager \
+            && echo "AppSpec uploaded to S3: ${S3_KEY}" \
+            || { echo "WARN: S3 upload gagal, coba inline revision"; USE_INLINE=true; }
 
-      - name: Create CodeDeploy deployment (Canary Blue/Green)
-        id: codedeploy
-        run: |
+          # Stop deployment aktif jika ada
           ACTIVE=$(aws deploy list-deployments \
             --application-name "$APP_NAME" \
             --deployment-group-name "$DEPLOYMENT_GROUP" \
@@ -296,11 +298,21 @@ jobs:
               --no-cli-pager || true
             sleep 5
           fi
+
+          # Pilih revision: S3 jika upload berhasil, inline jika gagal
+          if [ "${USE_INLINE:-false}" = "true" ]; then
+            APPSPEC_CONTENT=$(cat /tmp/appspec.json | tr -d '\n ' )
+            APPSPEC_SHA=$(echo -n "$APPSPEC_CONTENT" | sha256sum | cut -d' ' -f1)
+            REVISION="revisionType=AppSpecContent,appSpecContent={content=${APPSPEC_CONTENT},sha256=${APPSPEC_SHA}}"
+          else
+            REVISION="revisionType=S3,s3Location={bucket=${{ secrets.S3_DEPLOYMENT_BUCKET }},key=${S3_KEY},bundleType=JSON}"
+          fi
+
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name "$APP_NAME" \
             --deployment-group-name "$DEPLOYMENT_GROUP" \
             --deployment-config-name "CodeDeployDefault.LambdaCanary10Percent5Minutes" \
-            --revision "revisionType=S3,s3Location={bucket=${{ secrets.S3_DEPLOYMENT_BUCKET }},key=${{ steps.appspec.outputs.S3_KEY }},bundleType=JSON}" \
+            --revision "${REVISION}" \
             --description "Blue/Green order-management v${{ steps.publish.outputs.VERSION }}" \
             --region ${{ env.AWS_REGION }} \
             --query 'deploymentId' --output text --no-cli-pager)
@@ -476,6 +488,10 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Send SNS notification
+        # continue-on-error: SNS:Publish bisa diblok SCP di AWS Academy (voclabs role).
+        # Policy topic sudah diset di judge.sh step 4, tapi SCP bisa override.
+        # Job tetap "success" meski SNS gagal — notifikasi tidak menentukan deploy berhasil.
+        continue-on-error: true
         run: |
           LAMBDA_RESULT="${{ needs.deploy-lambda.result }}"
           BG_RESULT="${{ needs.deploy-bluegreen.result }}"
@@ -491,5 +507,6 @@ jobs:
             --subject "Deploy ${STATUS} - techno-serverless" \
             --message "Status=${STATUS} Commit=${{ github.sha }} Actor=${{ github.actor }} Branch=${{ github.ref_name }} Time=${TIMESTAMP} Lambda(6fn)=${LAMBDA_RESULT} BlueGreen(order-mgmt)=${BG_RESULT} Frontend=${FRONTEND_RESULT} Run=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --region ${{ env.AWS_REGION }} \
-            --no-cli-pager
-          echo "Notification sent - $STATUS"
+            --no-cli-pager \
+            && echo "Notification sent - $STATUS" \
+            || echo "WARN: SNS publish gagal (SCP restriction di AWS Academy) — deploy tetap dianggap berhasil"
