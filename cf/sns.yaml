@@ -1,0 +1,5 @@
+Resources:
+  TechnoOrderNotifications:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "techno-rds-order-notifications"

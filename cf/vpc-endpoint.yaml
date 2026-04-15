@@ -1,0 +1,76 @@
+Resources:
+  TechnoEventBridgeEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: 'Interface'
+      ServiceName: 'com.amazonaws.us-east-1.events'
+      VpcId: vpc-087ada894f35c2feb
+      PrivateDnsEnabled: true
+      SubnetIds: 
+        - subnet-033bfbb7bbab7fac0
+        - subnet-0ef9b2cd510a78b50
+      SecurityGroupIds:
+        - sg-07cbc24f1f359f47a
+      Tags:
+        - Key: Name
+          Value: "techno-eventbridge-endpoints"
+    
+  TechnoStepFunctionEndpoints:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: 'Interface'
+      ServiceName: 'com.amazonaws.us-east-1.states'
+      VpcId: vpc-087ada894f35c2feb
+      PrivateDnsEnabled: true
+      SubnetIds: 
+        - subnet-033bfbb7bbab7fac0
+        - subnet-0ef9b2cd510a78b50
+      SecurityGroupIds:
+        - sg-07cbc24f1f359f47a
+      Tags:
+        - Key: Name
+          Value: "techno-steps-endpoints"
+  
+  TechnoSNSEndpoints:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: 'Interface'
+      ServiceName: 'com.amazonaws.us-east-1.sns'
+      VpcId: vpc-087ada894f35c2feb
+      PrivateDnsEnabled: true
+      SubnetIds: 
+        - subnet-033bfbb7bbab7fac0
+        - subnet-0ef9b2cd510a78b50
+      SecurityGroupIds:
+        - sg-07cbc24f1f359f47a
+      Tags:
+        - Key: Name
+          Value: "techno-sns-endpoints"
+
+  TechnoSSMEndpoints:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: 'Interface'
+      ServiceName: 'com.amazonaws.us-east-1.secretsmanager'
+      VpcId: vpc-087ada894f35c2feb
+      PrivateDnsEnabled: true
+      SubnetIds: 
+        - subnet-033bfbb7bbab7fac0
+        - subnet-0ef9b2cd510a78b50
+      SecurityGroupIds:
+        - sg-07cbc24f1f359f47a
+      Tags:
+        - Key: Name
+          Value: "techno-secretsmanager-endpoints"
+
+  TechnoS3Endpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: 'Gateway'
+      VpcId: vpc-087ada894f35c2feb
+      ServiceName: 'com.amazonaws.us-east-1.s3'
+      RouteTableIds:
+        - rtb-0425f181bca8f7ad1
+      Tags:
+        - Key: Name
+          Value: "techno-s3-endpoints"

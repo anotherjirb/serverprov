@@ -1,0 +1,15 @@
+Resources:
+  TechnoUsagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    Properties:
+      ApiStages:
+        - ApiId: 8wt93lwrq4
+          Stage: production
+      Description: Usage Plans
+      Quota:
+        Limit: 100000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 2000
+        RateLimit: 1000
+      UsagePlanName: "techno-usage-plan"

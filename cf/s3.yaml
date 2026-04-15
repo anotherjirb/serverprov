@@ -1,0 +1,20 @@
+Resources:
+  ApplicationLogs:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 'techno-logs-jabriel-2026'
+      AccessControl: Private
+      Tags:
+        - Key: Name
+          Value: "techno-logs-jabriel-2026"
+
+  
+  OrderDocuments:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 'techno-orders-jabriel-2026'
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: "techno-orders-jabriel-2026"

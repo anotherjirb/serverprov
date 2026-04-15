@@ -1,0 +1,10 @@
+Resources:
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "techno-lks"
+      DBSubnetGroupName: String
+      SubnetIds: 
+        - String
+      Tags: 
+        - Tag

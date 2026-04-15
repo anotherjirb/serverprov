@@ -1,0 +1,44 @@
+Resources:
+  TechnoSGLambda:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: TechnoSGLambda
+      VpcId: vpc-087ada894f35c2feb
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: "techno-sg-lambda"
+  
+  TechnoSGRDS:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: TechnoSGRDS
+      VpcId: vpc-087ada894f35c2feb
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref TechnoSGLambda
+      Tags:
+        - Key: Name
+          Value: "techno-sg-rds"
+
+  TechnoSGVPCEndpoint:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: TechnoSGVPCEndpoint
+      VpcId: vpc-087ada894f35c2feb
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 35.10.0.0/18
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 35.10.0.0/18
+      Tags:
+        - Key: Name
+          Value: "techno-sg-vpc-endpoint"
